@@ -1,5 +1,15 @@
 # pi-cursor-auth
 
+> [!NOTE]
+> This is a fork of [morizkay/pi-cursor-auth](https://github.com/morizkay/pi-cursor-auth). Its `main` branch adds fixes that are not in an npm release yet. The [changelog](CHANGELOG.md) lists them under "Unreleased".
+>
+> To use this fork, remove the npm package first, because both packages register the `cursor` provider:
+>
+> ```bash
+> pi remove npm:pi-cursor-auth
+> pi install git:github.com/woosal1337/pi-cursor
+> ```
+
 A [pi](https://pi.dev) extension that registers **Cursor** as a pi model provider, using your [Cursor SDK](https://cursor.com) API key.
 
 Pi owns the agent loop, tools, and extensions (`pi-lens`, ponytail, hermes-memory, and the rest). Cursor is the model: this plugin streams thinking, text, and tool calls back into pi.
