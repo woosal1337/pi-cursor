@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep a cached model id, such as `grok-4.7`, until the live catalog loads. pi print mode never loads it, and interactive mode loads it a short time after start-up. Before this fix, such ids mapped to `default`, so Cursor ran its Auto model.
+
 ## [0.2.3] - 2026-09-04
 
 ### Fixed
