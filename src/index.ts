@@ -3,6 +3,8 @@ import {
   calculateCost,
   createProvider,
   envApiKeyAuth,
+  getCurrentSystemPrompt,
+  getCurrentTools,
 } from "@earendil-works/pi-ai";
 import {
   registerApiProvider,
@@ -73,6 +75,8 @@ export function createCursorProvider() {
     api: createCursorStreams({
       createStream: createAssistantMessageEventStream,
       calculateCost,
+      getCurrentSystemPrompt,
+      getCurrentTools,
     }),
   });
 }

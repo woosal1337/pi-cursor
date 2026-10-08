@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   extractLastUserImages,
   buildHarnessPrompt,
+  resolveTurnContext,
   collectToolCalls,
   unwrapCursorToolCall,
   thinkingParams,
@@ -456,6 +457,102 @@ test("runCursorTurn disables Cursor tools when pi has none", async () => {
   const done = stream.events.find((e) => e.type === "done");
   assert.equal(done.reason, "stop");
   assert.equal(done.message.content[0].text, "Sunny and calm today.");
+});
+
+// pi 0.86+ sends the prompt and tools as transcript system messages.
+const readTool = {
+  name: "read",
+  description: "Read a file",
+  parameters: { type: "object", properties: { path: { type: "string" } } },
+};
+const transcriptContext = {
+  messages: [
+    { role: "system", content: "Use pi tools.", toolsAdded: [readTool], timestamp: 0 },
+    { role: "user", content: "read package.json" },
+  ],
+};
+const transcriptHelpers = {
+  getCurrentSystemPrompt: (messages: any[]) =>
+    messages
+      .filter((m) => m.role === "system")
+      .map((m) => m.content)
+      .join("\n"),
+  getCurrentTools: (messages: any[]) =>
+    messages.flatMap((m) => (m.role === "system" ? (m.toolsAdded ?? []) : [])),
+};
+
+test("resolveTurnContext reads the prompt and tools from a pi transcript", () => {
+  const turn = resolveTurnContext(transcriptContext, transcriptHelpers);
+  assert.equal(turn.systemPrompt, "Use pi tools.");
+  assert.deepEqual(turn.tools.map((t) => t.name), ["read"]);
+  assert.equal(turn.messages, transcriptContext.messages);
+
+  const legacy = resolveTurnContext(
+    { systemPrompt: "Legacy.", tools: [readTool], messages: [] },
+    transcriptHelpers,
+  );
+  assert.equal(legacy.systemPrompt, "Legacy.");
+  assert.deepEqual(legacy.tools, [readTool]);
+
+  const bare = resolveTurnContext(transcriptContext);
+  assert.equal(bare.systemPrompt, "");
+  assert.deepEqual(bare.tools, []);
+});
+
+test("runCursorTurn gives Cursor the tools from a pi transcript", async () => {
+  setKnownModelIds(["default"]);
+  const stream = fakeStream();
+  let created: any;
+  let sent: any;
+  const createAgent = async (opts: any) => {
+    created = opts;
+    return {
+      send: async (message: any) => {
+        sent = message;
+        return {
+          stream: async function* () {
+            yield {
+              type: "assistant",
+              message: {
+                content: [
+                  {
+                    type: "tool_use",
+                    id: "c1",
+                    name: "read",
+                    input: { path: "package.json" },
+                  },
+                ],
+              },
+            };
+          },
+          cancel: async () => {},
+          wait: async () => ({ status: "cancelled" }),
+        };
+      },
+      close: () => {},
+    };
+  };
+
+  runCursorTurn({
+    model: { id: "default", api: "cursor-sdk", provider: "cursor" },
+    context: transcriptContext,
+    apiKey: "test-key",
+    deps: {
+      createStream: () => stream,
+      calculateCost: () => {},
+      createAgent,
+      ...transcriptHelpers,
+    },
+  });
+  await stream.closed;
+
+  assert.deepEqual(created.tools, ["mcp"]);
+  assert.equal(typeof created.local.customTools.read.execute, "function");
+  assert.match(sent, /Use pi tools\./);
+  const done = stream.events.find((e) => e.type === "done");
+  assert.equal(done.reason, "toolUse");
+  const toolCalls = done.message.content.filter((c: any) => c.type === "toolCall");
+  assert.equal(toolCalls[0].name, "read");
 });
 
 test("runCursorTurn consumes rejected SDK cancellation promises", async () => {
