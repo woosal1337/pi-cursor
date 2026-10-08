@@ -286,7 +286,27 @@ export function createCursorCompatApiProvider(streams: {
   };
 }
 
-function toPiModel(m: any): any {
+// pi offers xhigh and max only when the model's thinkingLevelMap declares them.
+export function thinkingLevelMap(
+  parameters: unknown,
+): Record<string, string> | undefined {
+  if (!Array.isArray(parameters)) return undefined;
+  const def = parameters.find(
+    (d: any) =>
+      /reason|think|effort/i.test(d?.id ?? "") ||
+      /reason|think|effort/i.test(d?.displayName ?? ""),
+  );
+  if (!def) return undefined;
+  const values = (def.values ?? []).map((v: any) => String(v?.value ?? v));
+  const map: Record<string, string> = {};
+  for (const level of ["xhigh", "max"]) {
+    if (values.includes(level)) map[level] = level;
+  }
+  return Object.keys(map).length ? map : undefined;
+}
+
+export function toPiModel(m: any): any {
+  const levels = thinkingLevelMap(m.parameters);
   return {
     id: m.id,
     name: m.displayName || m.id,
@@ -299,6 +319,7 @@ function toPiModel(m: any): any {
     contextWindow: 200000,
     maxTokens: 64000,
     cursorParameters: m.parameters,
+    ...(levels ? { thinkingLevelMap: levels } : {}),
   };
 }
 

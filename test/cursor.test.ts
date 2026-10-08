@@ -11,6 +11,8 @@ import {
   runCursorTurn,
   resolveCursorApiKey,
   fallbackModels,
+  thinkingLevelMap,
+  toPiModel,
   CURSOR_API,
   CURSOR_COMPAT_SOURCE_ID,
   createCursorCompatApiProvider,
@@ -190,6 +192,61 @@ test("resolveCursorApiKey prefers explicit key over placeholder/env/stored", () 
     resolveCursorApiKey(undefined, { env: "", stored: "" }),
     undefined,
   );
+});
+
+test("thinkingLevelMap declares xhigh and max only when Cursor offers them", () => {
+  const effort = (...values: string[]) => [
+    {
+      id: "reasoning_effort",
+      displayName: "Effort",
+      values: values.map((value) => ({ value })),
+    },
+    {
+      id: "fast",
+      displayName: "Fast",
+      values: [{ value: "false" }, { value: "true" }],
+    },
+  ];
+
+  assert.deepEqual(thinkingLevelMap(effort("low", "medium", "high", "xhigh")), {
+    xhigh: "xhigh",
+  });
+  assert.deepEqual(thinkingLevelMap(effort("low", "high", "xhigh", "max")), {
+    xhigh: "xhigh",
+    max: "max",
+  });
+  assert.equal(thinkingLevelMap(effort("low", "medium", "high")), undefined);
+  assert.equal(
+    thinkingLevelMap([{ id: "fast", values: [{ value: "true" }] }]),
+    undefined,
+  );
+  assert.equal(thinkingLevelMap(undefined), undefined);
+});
+
+test("toPiModel exposes Cursor's extended effort levels to pi", () => {
+  const grok = toPiModel({
+    id: "grok-4.7",
+    displayName: "Grok 4.7",
+    parameters: [
+      {
+        id: "reasoning_effort",
+        displayName: "Effort",
+        values: [
+          { value: "low" },
+          { value: "medium" },
+          { value: "high" },
+          { value: "xhigh" },
+        ],
+      },
+    ],
+  });
+  assert.deepEqual(grok.thinkingLevelMap, { xhigh: "xhigh" });
+  assert.deepEqual(thinkingParams(grok, "xhigh"), [
+    { id: "reasoning_effort", value: "xhigh" },
+  ]);
+
+  const plain = toPiModel({ id: "default", displayName: "Cursor Default" });
+  assert.equal("thinkingLevelMap" in plain, false);
 });
 
 test("runCursorTurn errors without an API key", async () => {

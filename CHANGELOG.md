@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Declare `xhigh` and `max` in the `thinkingLevelMap` of each Cursor model when the live catalog offers them. Before this fix, pi hid both levels, and `cursor/grok-4.7` stopped at `high`.
+
 ## [0.2.3] - 2026-09-04
 
 ### Fixed
