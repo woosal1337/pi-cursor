@@ -363,21 +363,107 @@ function applyUsage(
   calculateCost: any,
 ): void {
   if (!tokenUsage) return;
-  output.usage.input = tokenUsage.inputTokens ?? 0;
+  // Cursor's inputTokens include the cached tokens. pi counts cache reads and
+  // writes apart from input, so take them out to avoid counting them twice.
+  const cacheRead = tokenUsage.cacheReadTokens ?? 0;
+  const cacheWrite = tokenUsage.cacheWriteTokens ?? 0;
+  output.usage.input = Math.max(
+    0,
+    (tokenUsage.inputTokens ?? 0) - cacheRead - cacheWrite,
+  );
   output.usage.output = tokenUsage.outputTokens ?? 0;
-  output.usage.cacheRead = tokenUsage.cacheReadTokens ?? 0;
-  output.usage.cacheWrite = tokenUsage.cacheWriteTokens ?? 0;
+  output.usage.cacheRead = cacheRead;
+  output.usage.cacheWrite = cacheWrite;
   output.usage.totalTokens =
-    tokenUsage.totalTokens ??
-    output.usage.input +
-      output.usage.output +
-      output.usage.cacheRead +
-      output.usage.cacheWrite;
+    output.usage.input + output.usage.output + cacheRead + cacheWrite;
   try {
     calculateCost(model, output.usage);
   } catch {
     /* ignore cost calc errors */
   }
+}
+
+// Same value as pi's own context estimate.
+const ESTIMATED_IMAGE_CHARS = 4800;
+
+function contentChars(content: unknown): number {
+  if (typeof content === "string") return content.length;
+  if (!Array.isArray(content)) return 0;
+  let chars = 0;
+  for (const block of content) {
+    if (block?.type === "text") chars += block.text?.length ?? 0;
+    else if (block?.type === "thinking") chars += block.thinking?.length ?? 0;
+    else if (block?.type === "toolCall") {
+      chars +=
+        (block.name?.length ?? 0) + JSON.stringify(block.arguments ?? {}).length;
+    } else if (block?.type === "image") chars += ESTIMATED_IMAGE_CHARS;
+  }
+  return chars;
+}
+
+function usageTokens(usage: any): number {
+  if (!usage) return 0;
+  return (
+    usage.totalTokens ||
+    (usage.input ?? 0) +
+      (usage.output ?? 0) +
+      (usage.cacheRead ?? 0) +
+      (usage.cacheWrite ?? 0)
+  );
+}
+
+// Cursor reports usage only when a run ends. A turn that hands a tool call to
+// pi cancels its run, so Cursor reports nothing for that turn. Estimate it the
+// way pi estimates context: the last reported usage, plus one token for each
+// 4 characters after it.
+export function estimateTurnUsage(
+  context: any,
+  content: unknown,
+): { input: number; output: number } {
+  const messages: any[] = (context?.messages ?? []).filter(
+    (m: any) => m?.role !== "system",
+  );
+  let known = 0;
+  let start = 0;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (
+      m?.role === "assistant" &&
+      m.stopReason !== "aborted" &&
+      m.stopReason !== "error" &&
+      usageTokens(m.usage) > 0
+    ) {
+      known = usageTokens(m.usage);
+      start = i + 1;
+      break;
+    }
+  }
+  let chars = 0;
+  if (start === 0) {
+    chars += context?.systemPrompt?.length ?? 0;
+    chars += JSON.stringify(context?.tools ?? []).length;
+  }
+  for (const m of messages.slice(start)) chars += contentChars(m?.content);
+  return {
+    input: known + Math.ceil(chars / 4),
+    output: Math.ceil(contentChars(content) / 4),
+  };
+}
+
+function applyEstimatedUsage(
+  output: any,
+  context: any,
+  model: any,
+  calculateCost: any,
+): void {
+  if (usageTokens(output.usage) > 0) return;
+  const estimate = estimateTurnUsage(context, output.content);
+  applyUsage(
+    output,
+    { inputTokens: estimate.input, outputTokens: estimate.output },
+    model,
+    calculateCost,
+  );
 }
 
 function makeBlockAppenders(output: any, stream: any) {
@@ -641,6 +727,7 @@ export function runCursorTurn(opts: {
 
       if (captured.length) {
         blocks.emitToolCalls(captured);
+        applyEstimatedUsage(output, context, model, deps.calculateCost);
         output.stopReason = "toolUse";
         stream.push({ type: "done", reason: "toolUse", message: output });
       } else if (options?.signal?.aborted || result?.status === "cancelled") {
@@ -652,6 +739,7 @@ export function runCursorTurn(opts: {
       } else if (result?.status === "finished" || !result) {
         blocks.closeThinking();
         blocks.closeText();
+        applyEstimatedUsage(output, context, model, deps.calculateCost);
         output.stopReason = "stop";
         stream.push({ type: "done", reason: "stop", message: output });
       } else {

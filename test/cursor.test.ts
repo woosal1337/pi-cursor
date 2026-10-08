@@ -13,6 +13,7 @@ import {
   fallbackModels,
   CURSOR_API,
   CURSOR_COMPAT_SOURCE_ID,
+  estimateTurnUsage,
   createCursorCompatApiProvider,
   configureCursorRipgrepPath,
 } from "../src/cursor-core.ts";
@@ -356,6 +357,126 @@ test("runCursorTurn unwraps Cursor MCP tool calls into pi tool names", async () 
   const toolCalls = done.message.content.filter((c: any) => c.type === "toolCall");
   assert.equal(toolCalls[0].name, "read");
   assert.equal(toolCalls[0].arguments.path, "package.json");
+});
+
+test("runCursorTurn counts Cursor's cached input tokens once", async () => {
+  setKnownModelIds(["default"]);
+  const stream = fakeStream();
+  // Cursor's inputTokens include cacheReadTokens, and its totalTokens counts them twice.
+  const usage = {
+    inputTokens: 4635,
+    outputTokens: 630,
+    cacheReadTokens: 2560,
+    cacheWriteTokens: 0,
+    totalTokens: 7825,
+  };
+  const createAgent = async () => ({
+    send: async () => ({
+      stream: async function* () {
+        yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
+        yield { type: "usage", usage };
+      },
+      cancel: async () => {},
+      wait: async () => ({ status: "finished", usage }),
+    }),
+    close: () => {},
+  });
+
+  runCursorTurn({
+    model: { id: "default", api: "cursor-sdk", provider: "cursor" },
+    context: { messages: [{ role: "user", content: "hi" }] },
+    apiKey: "test-key",
+    deps: { createStream: () => stream, calculateCost: () => {}, createAgent },
+  });
+  await stream.closed;
+
+  const done = stream.events.find((e) => e.type === "done");
+  assert.equal(done.reason, "stop");
+  assert.equal(done.message.usage.input, 2075);
+  assert.equal(done.message.usage.cacheRead, 2560);
+  assert.equal(done.message.usage.output, 630);
+  assert.equal(done.message.usage.totalTokens, 5265);
+});
+
+test("estimateTurnUsage starts from the last usage that Cursor reported", () => {
+  const reported = {
+    role: "assistant",
+    stopReason: "toolUse",
+    content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
+    usage: { input: 9000, output: 1000, cacheRead: 0, cacheWrite: 0, totalTokens: 10000 },
+  };
+  const aborted = { ...reported, stopReason: "aborted", usage: { totalTokens: 99999 } };
+  const estimate = estimateTurnUsage(
+    {
+      systemPrompt: "ignored when usage exists",
+      messages: [
+        { role: "system", content: "ignored" },
+        { role: "user", content: "read pkg" },
+        reported,
+        { role: "toolResult", content: [{ type: "text", text: "x".repeat(400) }] },
+        aborted,
+      ],
+    },
+    [{ type: "text", text: "y".repeat(80) }],
+  );
+  // 10,000 reported tokens, then 400 + 6 characters from the later messages.
+  assert.deepEqual(estimate, { input: 10102, output: 20 });
+
+  const first = estimateTurnUsage(
+    { systemPrompt: "p".repeat(40), tools: [], messages: [{ role: "user", content: "u".repeat(58) }] },
+    [],
+  );
+  // No usage yet: count the prompt, the tool schemas ("[]"), and the messages.
+  assert.deepEqual(first, { input: 25, output: 0 });
+});
+
+test("runCursorTurn estimates usage for a turn that hands a tool call to pi", async () => {
+  setKnownModelIds(["default"]);
+  const stream = fakeStream();
+  const createAgent = async () => ({
+    send: async () => ({
+      stream: async function* () {
+        yield {
+          type: "assistant",
+          message: {
+            content: [
+              { type: "tool_use", id: "c1", name: "read", input: { path: "package.json" } },
+            ],
+          },
+        };
+      },
+      cancel: async () => {},
+      wait: async () => ({ status: "cancelled" }),
+    }),
+    close: () => {},
+  });
+  const context = {
+    systemPrompt: "Use pi tools.",
+    messages: [{ role: "user", content: "read package.json" }],
+    tools: [
+      {
+        name: "read",
+        description: "Read a file",
+        parameters: { type: "object", properties: { path: { type: "string" } } },
+      },
+    ],
+  };
+
+  runCursorTurn({
+    model: { id: "default", api: "cursor-sdk", provider: "cursor" },
+    context,
+    apiKey: "test-key",
+    deps: { createStream: () => stream, calculateCost: () => {}, createAgent },
+  });
+  await stream.closed;
+
+  const done = stream.events.find((e) => e.type === "done");
+  assert.equal(done.reason, "toolUse");
+  const expected = estimateTurnUsage(context, done.message.content);
+  assert.ok(expected.input > 0 && expected.output > 0);
+  assert.equal(done.message.usage.input, expected.input);
+  assert.equal(done.message.usage.output, expected.output);
+  assert.equal(done.message.usage.totalTokens, expected.input + expected.output);
 });
 
 test("runCursorTurn disables Cursor tools when pi has none", async () => {
