@@ -10,7 +10,8 @@ const MODEL_ALIASES: Record<string, string> = {
   auto: "default",
 };
 
-const knownModelIds = new Set<string>(["default"]);
+// Empty until a live catalog loads in this process.
+const knownModelIds = new Set<string>();
 const require = createRequire(import.meta.url);
 
 const CURSOR_PLATFORM_PACKAGES: Record<string, string> = {
@@ -55,11 +56,14 @@ export function configureCursorRipgrepPath(
 export function setKnownModelIds(ids: string[]): void {
   knownModelIds.clear();
   for (const id of ids) knownModelIds.add(id);
-  knownModelIds.add("default");
+  if (knownModelIds.size) knownModelIds.add("default");
 }
 
 function resolveModelId(requested: string): string {
   if (MODEL_ALIASES[requested]) return MODEL_ALIASES[requested];
+  // Before a live catalog loads, keep the requested ID. pi's cached catalog
+  // came from Cursor, so a cached model such as grok-4.7 is valid.
+  if (!knownModelIds.size) return requested;
   return knownModelIds.has(requested) ? requested : "default";
 }
 
@@ -352,7 +356,6 @@ export function fallbackModels(): any[] {
   return FALLBACK_MODELS;
 }
 
-setKnownModelIds(FALLBACK_MODELS.map((m) => m.id));
 
 export async function discoverCursorModels(
   apiKey: string | undefined,

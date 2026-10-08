@@ -22,7 +22,6 @@ import {
   resolveCursorApiKey,
   discoverCursorModels,
   fallbackModels,
-  setKnownModelIds,
   createCursorStreams,
 } from "./cursor-core.js";
 
@@ -57,9 +56,9 @@ async function fetchCursorModels(context: any): Promise<any[]> {
   const live = await discoverCursorModels(
     resolveCursorApiKey(stored, { env: process.env.CURSOR_API_KEY }),
   );
-  const models = live.length ? live : fallbackModels();
-  setKnownModelIds(models.map((m) => m.id));
-  return models;
+  // discoverCursorModels() records the live IDs. The fallback list must not
+  // replace them, or cached models such as grok-4.7 would map to default.
+  return live.length ? live : fallbackModels();
 }
 
 export function createCursorProvider() {

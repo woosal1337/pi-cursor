@@ -280,6 +280,41 @@ test("runCursorTurn maps unknown model id to default", async () => {
   assert.match(error.error.errorMessage, /No Cursor API key/);
 });
 
+test("runCursorTurn keeps a cached model id until the live catalog loads", async () => {
+  const sentModelId = async (id: string) => {
+    const stream = fakeStream();
+    let created: any;
+    const createAgent = async (opts: any) => {
+      created = opts;
+      return {
+        send: async () => ({
+          stream: async function* () {},
+          cancel: async () => {},
+          wait: async () => ({ status: "finished" }),
+        }),
+        close: () => {},
+      };
+    };
+    runCursorTurn({
+      model: { id, api: "cursor-sdk", provider: "cursor" },
+      context: { messages: [{ role: "user", content: "hi" }] },
+      apiKey: "test-key",
+      deps: { createStream: () => stream, calculateCost: () => {}, createAgent },
+    });
+    await stream.closed;
+    return created.model.id;
+  };
+
+  // pi print mode loads models from its cache and never fetches the live catalog.
+  setKnownModelIds([]);
+  assert.equal(await sentModelId("grok-4.7"), "grok-4.7");
+  assert.equal(await sentModelId("auto"), "default");
+
+  setKnownModelIds(["grok-4.7"]);
+  assert.equal(await sentModelId("grok-4.7"), "grok-4.7");
+  assert.equal(await sentModelId("not-a-cursor-model"), "default");
+});
+
 test("runCursorTurn emits pi toolCall events and does not enable Cursor tools", async () => {
   setKnownModelIds(["default"]);
   const stream = fakeStream();

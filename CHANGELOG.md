@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Read the system prompt and tools from pi's transcript system messages. Since pi 0.86, providers get a `TranscriptContext` without `context.systemPrompt` or `context.tools`, so Cursor ran with no pi tools and no system prompt.
 - Estimate usage for a turn that hands a tool call to pi. Cursor reports usage only when a run ends, so these turns had zero usage, and context gauges such as `pi-minimal-footer` showed an empty context.
 - Count Cursor's cached input tokens once. Cursor's `inputTokens` include `cacheReadTokens`, so pi showed too many tokens when Cursor used its cache.
+- Keep a cached model id, such as `grok-4.7`, until the live catalog loads. pi print mode never loads it, and interactive mode loads it a short time after start-up. Before this fix, such ids mapped to `default`, so Cursor ran its Auto model.
 
 ## [0.2.3] - 2026-09-04
 
