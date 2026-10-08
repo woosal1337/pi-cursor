@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Read the system prompt and tools from pi's transcript system messages. Since pi 0.86, providers get a `TranscriptContext` without `context.systemPrompt` or `context.tools`, so Cursor ran with no pi tools and no system prompt.
+
 ## [0.2.3] - 2026-09-04
 
 ### Fixed

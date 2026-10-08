@@ -155,6 +155,23 @@ export function buildHarnessPrompt(context: any): string {
   return parts.join("\n\n");
 }
 
+// pi 0.86+ sends a TranscriptContext: the system prompt and the tools live in
+// system messages, not in context.systemPrompt and context.tools.
+export function resolveTurnContext(
+  context: any,
+  transcript: Pick<TurnDeps, "getCurrentSystemPrompt" | "getCurrentTools"> = {},
+): { systemPrompt: string; messages: any[]; tools: any[] } {
+  const messages: any[] = context?.messages ?? [];
+  return {
+    systemPrompt:
+      context?.systemPrompt ??
+      transcript.getCurrentSystemPrompt?.(messages) ??
+      "",
+    messages,
+    tools: context?.tools ?? transcript.getCurrentTools?.(messages) ?? [],
+  };
+}
+
 const MCP_META = new Set([
   "mcp",
   "CallMcpTool",
@@ -334,6 +351,8 @@ interface TurnDeps {
   createStream: () => any;
   calculateCost: (model: any, usage: any) => void;
   createAgent?: (opts: any) => Promise<any>;
+  getCurrentSystemPrompt?: (messages: any[]) => string;
+  getCurrentTools?: (messages: any[]) => any[];
 }
 
 function makeInitialMessage(model: any): any {
@@ -492,7 +511,8 @@ export function runCursorTurn(opts: {
   apiKey: string | undefined;
   deps: TurnDeps;
 }): any {
-  const { model, context, options, apiKey, deps } = opts;
+  const { model, options, apiKey, deps } = opts;
+  const context = resolveTurnContext(opts.context, deps);
   const stream = deps.createStream();
   const createAgent = deps.createAgent ?? ((o: any) => Agent.create(o));
 

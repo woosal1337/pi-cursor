@@ -42,6 +42,8 @@ declare module "@earendil-works/pi-ai" {
     name: string,
     envVars: readonly string[],
   ): any;
+  export function getCurrentSystemPrompt(messages: readonly any[]): string;
+  export function getCurrentTools(messages: readonly any[]): any[];
 }
 
 declare module "@earendil-works/pi-ai/compat" {
