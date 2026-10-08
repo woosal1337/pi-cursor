@@ -11,7 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Declare `xhigh` and `max` in the `thinkingLevelMap` of each Cursor model when the live catalog offers them. Before this fix, pi hid both levels, and `cursor/grok-4.7` stopped at `high`.
 - Read the system prompt and tools from pi's transcript system messages. Since pi 0.86, providers get a `TranscriptContext` without `context.systemPrompt` or `context.tools`, so Cursor ran with no pi tools and no system prompt.
-- Estimate usage for a turn that hands a tool call to pi. Cursor reports usage only when a run ends, so these turns had zero usage, and context gauges such as `pi-minimal-footer` showed an empty context.
+- Estimate usage for a turn that hands a tool call to pi. Cursor reports usage only when a run ends, so these turns had zero usage, and context gauges such as `pi-minimal-footer` showed an empty context. The estimate adds Cursor's own agent prompt and ignores usage from before a compaction.
 - Count Cursor's cached input tokens once. Cursor's `inputTokens` include `cacheReadTokens`, so pi showed too many tokens when Cursor used its cache.
 - Keep a cached model id, such as `grok-4.7`, until the live catalog loads. pi print mode never loads it, and interactive mode loads it a short time after start-up. Before this fix, such ids mapped to `default`, so Cursor ran its Auto model.
 

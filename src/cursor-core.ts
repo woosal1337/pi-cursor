@@ -455,6 +455,11 @@ function usageTokens(usage: any): number {
   );
 }
 
+// Cursor adds its own agent prompt, which the bridge cannot see. Live runs
+// with pi's default tools measured 3,400 to 4,300 tokens more than the
+// estimate of the prompt that the bridge sends.
+const CURSOR_PROMPT_TOKENS = 4000;
+
 // Cursor reports usage only when a run ends. A turn that hands a tool call to
 // pi cancels its run, so Cursor reports nothing for that turn. Estimate it the
 // way pi estimates context: the last reported usage, plus one token for each
@@ -466,31 +471,31 @@ export function estimateTurnUsage(
   const messages: any[] = (context?.messages ?? []).filter(
     (m: any) => m?.role !== "system",
   );
-  let known = 0;
-  let start = 0;
+  let chars =
+    (context?.systemPrompt?.length ?? 0) +
+    JSON.stringify(context?.tools ?? []).length;
+  for (const m of messages) chars += contentChars(m?.content);
+  let input = CURSOR_PROMPT_TOKENS + Math.ceil(chars / 4);
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (
-      m?.role === "assistant" &&
-      m.stopReason !== "aborted" &&
-      m.stopReason !== "error" &&
-      usageTokens(m.usage) > 0
+      m?.role !== "assistant" ||
+      m.stopReason === "aborted" ||
+      m.stopReason === "error" ||
+      !(usageTokens(m.usage) > 0)
     ) {
-      known = usageTokens(m.usage);
-      start = i + 1;
-      break;
+      continue;
     }
+    let after = 0;
+    for (const later of messages.slice(i + 1)) after += contentChars(later?.content);
+    const reported = usageTokens(m.usage) + Math.ceil(after / 4);
+    // Usage from before a compaction or a branch change does not match this
+    // prompt. Use it only when it is near the full estimate. Otherwise pi
+    // could see the old size and compact again.
+    if (reported < input * 1.5 && reported > input / 1.5) input = reported;
+    break;
   }
-  let chars = 0;
-  if (start === 0) {
-    chars += context?.systemPrompt?.length ?? 0;
-    chars += JSON.stringify(context?.tools ?? []).length;
-  }
-  for (const m of messages.slice(start)) chars += contentChars(m?.content);
-  return {
-    input: known + Math.ceil(chars / 4),
-    output: Math.ceil(contentChars(content) / 4),
-  };
+  return { input, output: Math.ceil(contentChars(content) / 4) };
 }
 
 function applyEstimatedUsage(
