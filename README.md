@@ -82,7 +82,16 @@ To save Cursor as the startup default, select it in `/model` and press **Ctrl+S*
 }
 ```
 
-Unknown model ids, including `auto-smart`, are mapped to `cursor/default`.
+`auto` and `auto-smart` map to `cursor/default`. After the live catalog loads, other unknown model ids also map to `cursor/default`.
+
+### Fast mode and context size
+
+Cursor offers a Fast mode for some models, such as the Grok models. Fast mode streams faster and costs two to three times as much.
+
+- `cursor/<model>` runs with Fast off.
+- `cursor/<model>-fast`, such as `cursor/grok-4.7-fast`, runs with Fast on. The copy exists only for models that offer Fast mode.
+
+The bridge also sends the smallest context size that the model offers, such as 256k for `grok-4.7`. pi uses that size as the context window, so the footer and compaction match it. Without these values, Cursor uses the default variant of each model, which turns Fast on for Grok and picks the largest context.
 
 ## Commands
 
@@ -101,7 +110,9 @@ The extension registers a complete pi `Provider` via `createProvider()`. It also
 ## Limitations
 
 - Each pi model round-trip creates a fresh Cursor agent with `tools: []` (or MCP-only for pi tools). Cursor does not keep its own tool loop or session memory.
-- Model context windows and costs are not available per-model from the SDK catalog, so costs show as $0 in usage. Token counts are accurate.
+- Costs are not available from the SDK catalog, so costs show as $0 in usage.
+- A model without a context option in the catalog gets a 200K context window.
+- Cursor reports token usage only when a run ends. A turn that hands a tool call to pi gets an estimate instead.
 
 ## Development
 

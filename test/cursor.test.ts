@@ -8,6 +8,9 @@ import {
   collectToolCalls,
   unwrapCursorToolCall,
   thinkingParams,
+  cursorModelParams,
+  defaultContext,
+  withFastVariants,
   setKnownModelIds,
   runCursorTurn,
   resolveCursorApiKey,
@@ -141,6 +144,90 @@ test("thinkingParams maps pi reasoning onto Cursor model params", () => {
   ]);
   assert.equal(thinkingParams(model, "off"), undefined);
   assert.equal(thinkingParams({}, "high"), undefined);
+});
+
+// Parameters as Cursor's catalog lists them for grok-4.7.
+const grokParameters = [
+  { id: "context", values: [{ value: "256k" }, { value: "500k" }] },
+  { id: "reasoning_effort", values: ["low", "medium", "high", "xhigh"].map((value) => ({ value })) },
+  { id: "fast", values: [{ value: "false" }, { value: "true" }] },
+];
+
+test("cursorModelParams sends fast and the smallest context every time", () => {
+  const grok = toPiModel({ id: "grok-4.7", displayName: "Grok 4.7", parameters: grokParameters });
+  assert.deepEqual(cursorModelParams(grok, "xhigh"), [
+    { id: "reasoning_effort", value: "xhigh" },
+    { id: "fast", value: "false" },
+    { id: "context", value: "256k" },
+  ]);
+  assert.deepEqual(cursorModelParams({ ...grok, cursorFast: true }, undefined), [
+    { id: "fast", value: "true" },
+    { id: "context", value: "256k" },
+  ]);
+  // A model without fast or context options gets neither.
+  assert.equal(cursorModelParams({ cursorParameters: [] }, "high"), undefined);
+});
+
+test("toPiModel sets the context window from the smallest Cursor context", () => {
+  const window = (values: string[]) =>
+    toPiModel({ id: "m", parameters: [{ id: "context", values: values.map((value) => ({ value })) }] })
+      .contextWindow;
+  assert.equal(window(["256k", "500k"]), 256000);
+  assert.equal(window(["1m", "300k"]), 300000);
+  assert.equal(window(["272k", "1m"]), 272000);
+  assert.equal(toPiModel({ id: "default" }).contextWindow, 200000);
+  assert.deepEqual(defaultContext([{ id: "context", values: [{ value: "1m" }] }]), {
+    value: "1m",
+    tokens: 1000000,
+  });
+});
+
+test("withFastVariants adds a -fast copy of each model that offers Fast", () => {
+  const grok = toPiModel({ id: "grok-4.7", displayName: "Grok 4.7", parameters: grokParameters });
+  const plain = toPiModel({ id: "claude-sonnet-4", displayName: "Claude Sonnet 4" });
+  const models = withFastVariants([grok, plain]);
+  assert.deepEqual(models.map((m) => m.id), ["grok-4.7", "grok-4.7-fast", "claude-sonnet-4"]);
+  const fast = models[1];
+  assert.equal(fast.name, "Grok 4.7 Fast");
+  assert.equal(fast.cursorModelId, "grok-4.7");
+  assert.equal(fast.cursorFast, true);
+  assert.deepEqual(fast.thinkingLevelMap, grok.thinkingLevelMap);
+  assert.equal(fast.contextWindow, 256000);
+});
+
+test("runCursorTurn sends a -fast copy as its Cursor model with fast on", async () => {
+  setKnownModelIds(["grok-4.7"]);
+  const stream = fakeStream();
+  let created: any;
+  const createAgent = async (opts: any) => {
+    created = opts;
+    return {
+      send: async () => ({
+        stream: async function* () {},
+        cancel: async () => {},
+        wait: async () => ({ status: "finished" }),
+      }),
+      close: () => {},
+    };
+  };
+  const grok = toPiModel({ id: "grok-4.7", displayName: "Grok 4.7", parameters: grokParameters });
+  const [, fast] = withFastVariants([grok]);
+  runCursorTurn({
+    model: fast,
+    context: { messages: [{ role: "user", content: "hi" }] },
+    options: { reasoning: "high" },
+    apiKey: "test-key",
+    deps: { createStream: () => stream, calculateCost: () => {}, createAgent },
+  });
+  await stream.closed;
+  assert.deepEqual(created.model, {
+    id: "grok-4.7",
+    params: [
+      { id: "reasoning_effort", value: "high" },
+      { id: "fast", value: "true" },
+      { id: "context", value: "256k" },
+    ],
+  });
 });
 
 test("cursor streams expose a pi-ai compat registration", () => {

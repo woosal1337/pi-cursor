@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A `-fast` copy of each model that offers Cursor's Fast mode, such as `cursor/grok-4.7-fast`. The copy sends `fast=true`.
+
+### Changed
+
+- Send `fast=false` and the smallest context option on every request. Before, Cursor used the default variant of each model, which turned Fast on for Grok and picked the 500k context for `grok-4.7`.
+- Set the context window from the context option that the bridge sends, such as 256,000 tokens for `grok-4.7`. Models without a context option keep 200,000 tokens.
+
 ### Fixed
 
 - Declare `xhigh` and `max` in the `thinkingLevelMap` of each Cursor model when the live catalog offers them. Before this fix, pi hid both levels, and `cursor/grok-4.7` stopped at `high`.
