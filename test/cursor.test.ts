@@ -399,35 +399,39 @@ test("runCursorTurn counts Cursor's cached input tokens once", async () => {
 });
 
 test("estimateTurnUsage starts from the last usage that Cursor reported", () => {
-  const reported = {
+  const reported = (total: number) => ({
     role: "assistant",
     stopReason: "toolUse",
     content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
-    usage: { input: 9000, output: 1000, cacheRead: 0, cacheWrite: 0, totalTokens: 10000 },
-  };
-  const aborted = { ...reported, stopReason: "aborted", usage: { totalTokens: 99999 } };
-  const estimate = estimateTurnUsage(
-    {
-      systemPrompt: "ignored when usage exists",
-      messages: [
-        { role: "system", content: "ignored" },
-        { role: "user", content: "read pkg" },
-        reported,
-        { role: "toolResult", content: [{ type: "text", text: "x".repeat(400) }] },
-        aborted,
-      ],
-    },
-    [{ type: "text", text: "y".repeat(80) }],
-  );
-  // 10,000 reported tokens, then 400 + 6 characters from the later messages.
-  assert.deepEqual(estimate, { input: 10102, output: 20 });
+    usage: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: total },
+  });
+  const context = (anchor: any) => ({
+    systemPrompt: "s".repeat(4000),
+    tools: [],
+    messages: [
+      { role: "system", content: "ignored" },
+      { role: "user", content: "u".repeat(4000) },
+      anchor,
+      { role: "toolResult", content: [{ type: "text", text: "x".repeat(400) }] },
+      { ...anchor, stopReason: "aborted", usage: { totalTokens: 99999 } },
+    ],
+  });
+  // Full estimate: 4,000 for Cursor's own prompt, plus (4,000 + 2 + 4,000 + 6 + 400 + 6) / 4.
+  const full = 4000 + Math.ceil(8414 / 4);
 
+  // 6,000 reported tokens, then (400 + 6) / 4 for the later messages.
+  const fresh = estimateTurnUsage(context(reported(6000)), [{ type: "text", text: "y".repeat(80) }]);
+  assert.deepEqual(fresh, { input: 6102, output: 20 });
+
+  // Usage from before a compaction is far from the full estimate, so it is not used.
+  assert.deepEqual(estimateTurnUsage(context(reported(180000)), []), { input: full, output: 0 });
+
+  // No usage yet: Cursor's own prompt, then the prompt, the tool schemas ("[]"), and the messages.
   const first = estimateTurnUsage(
     { systemPrompt: "p".repeat(40), tools: [], messages: [{ role: "user", content: "u".repeat(58) }] },
     [],
   );
-  // No usage yet: count the prompt, the tool schemas ("[]"), and the messages.
-  assert.deepEqual(first, { input: 25, output: 0 });
+  assert.deepEqual(first, { input: 4025, output: 0 });
 });
 
 test("runCursorTurn estimates usage for a turn that hands a tool call to pi", async () => {
