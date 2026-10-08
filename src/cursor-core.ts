@@ -251,6 +251,53 @@ export function thinkingParams(
   return [{ id: def.id, value: String(value) }];
 }
 
+function paramValues(defs: unknown, id: string): string[] {
+  if (!Array.isArray(defs)) return [];
+  const def = defs.find((d: any) => d?.id === id);
+  return (def?.values ?? []).map((v: any) => String(v?.value ?? v));
+}
+
+// Cursor names context sizes such as "256k" and "1m".
+function contextTokens(value: string): number | undefined {
+  const match = /^(\d+(?:\.\d+)?)([km])$/i.exec(value.trim());
+  if (!match) return undefined;
+  const unit = match[2].toLowerCase() === "m" ? 1_000_000 : 1_000;
+  return Math.round(Number(match[1]) * unit);
+}
+
+// The smallest context option. Cursor's default variant often picks the
+// largest one, which costs more for each token.
+export function defaultContext(
+  defs: unknown,
+): { value: string; tokens: number } | undefined {
+  let smallest: { value: string; tokens: number } | undefined;
+  for (const value of paramValues(defs, "context")) {
+    const tokens = contextTokens(value);
+    if (tokens && (!smallest || tokens < smallest.tokens)) {
+      smallest = { value, tokens };
+    }
+  }
+  return smallest;
+}
+
+// Send fast and context on every request. Without them, Cursor uses the
+// model's default variant, which turns Fast on for Grok and picks the
+// largest context.
+export function cursorModelParams(
+  model: any,
+  reasoning: string | undefined,
+): any[] | undefined {
+  const defs = model?.cursorParameters ?? model?.parameters ?? [];
+  const params = [...(thinkingParams(model, reasoning) ?? [])];
+  const fast = model?.cursorFast ? "true" : "false";
+  if (paramValues(defs, "fast").includes(fast)) {
+    params.push({ id: "fast", value: fast });
+  }
+  const context = defaultContext(defs);
+  if (context) params.push({ id: "context", value: context.value });
+  return params.length ? params : undefined;
+}
+
 function toCustomTools(
   tools: any[],
   onCall: (call: {
@@ -337,11 +384,31 @@ export function toPiModel(m: any): any {
     reasoning: true,
     input: ["text", "image"],
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: 200000,
+    contextWindow: defaultContext(m.parameters)?.tokens ?? 200000,
     maxTokens: 64000,
     cursorParameters: m.parameters,
     ...(levels ? { thinkingLevelMap: levels } : {}),
   };
+}
+
+// pi lists a "-fast" copy of each model that offers Cursor's Fast mode, such
+// as grok-4.7-fast. The copy sends fast=true, and the original sends
+// fast=false.
+export function withFastVariants(models: any[]): any[] {
+  return models.flatMap((m) =>
+    paramValues(m.cursorParameters, "fast").includes("true")
+      ? [
+          m,
+          {
+            ...m,
+            id: `${m.id}-fast`,
+            name: `${m.name} Fast`,
+            cursorModelId: m.id,
+            cursorFast: true,
+          },
+        ]
+      : [m],
+  );
 }
 
 const FALLBACK_MODELS: any[] = [
@@ -356,7 +423,6 @@ export function fallbackModels(): any[] {
   return FALLBACK_MODELS;
 }
 
-
 export async function discoverCursorModels(
   apiKey: string | undefined,
 ): Promise<any[]> {
@@ -365,7 +431,7 @@ export async function discoverCursorModels(
     const models = await Cursor.models.list({ apiKey });
     const mapped = (models ?? []).map(toPiModel);
     if (mapped.length) setKnownModelIds(mapped.map((m: any) => m.id));
-    return mapped;
+    return withFastVariants(mapped);
   } catch {
     return [];
   }
@@ -645,7 +711,7 @@ export function runCursorTurn(opts: {
       return;
     }
 
-    const modelId = resolveModelId(model.id);
+    const modelId = resolveModelId(model.cursorModelId ?? model.id);
     let agent: any;
     let run: any;
     const captured: any[] = [];
@@ -689,7 +755,7 @@ export function runCursorTurn(opts: {
       const piTools: any[] = context?.tools ?? [];
       let prompt = buildHarnessPrompt(context);
       const images = extractLastUserImages(context);
-      const params = thinkingParams(model, options?.reasoning);
+      const params = cursorModelParams(model, options?.reasoning);
       let payload: any = {
         text: prompt,
         images,
