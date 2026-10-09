@@ -465,26 +465,151 @@ function makeInitialMessage(model: any): any {
   };
 }
 
-function applyUsage(
+// Cursor reports usage only when a run ends, as the sum of every model call
+// in that run. Each tool call inside a run adds one call, and the first tool
+// use adds one more hidden call that loads the tool schemas. A run that the
+// bridge cancels to hand a tool call to pi reports no usage.
+//
+// pi reads the last assistant message as the size of the context, so the
+// bridge records the size of one model call. Each message gets a
+// "cursor_usage" diagnostic with the prompt size in characters and tokens.
+// The next turns use its characters per token for their estimate.
+const CURSOR_USAGE_DIAGNOSTIC = "cursor_usage";
+
+// Characters per token before the first measurement in a chat. Live Grok
+// runs measured about 3 for code and tool output, and about 4 for prose.
+const DEFAULT_CHARS_PER_TOKEN = 3.5;
+const MIN_CHARS_PER_TOKEN = 2.5;
+const MAX_CHARS_PER_TOKEN = 5;
+
+// Cursor adds its own agent prompt to the prompt and the tool definitions
+// that the bridge sends. Live runs measured about 4,000 tokens.
+const CURSOR_PROMPT_TOKENS = 4000;
+
+// Same value as pi's own context estimate (4,800 characters).
+const ESTIMATED_IMAGE_TOKENS = 1200;
+
+const MAX_MODEL_CALLS = 16;
+
+export interface CursorUsageNote {
+  source: "measured" | "estimated";
+  model: string;
+  // Characters of the prompt text and the tool definitions.
+  promptChars: number;
+  // Tokens of the prompt of one model call.
+  promptTokens: number;
+  charsPerToken: number;
+  modelCalls?: number;
+  // Cursor's sums for the whole run.
+  reported?: Record<string, number>;
+}
+
+function clampCharsPerToken(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  if (n <= 0) return DEFAULT_CHARS_PER_TOKEN;
+  return Math.min(MAX_CHARS_PER_TOKEN, Math.max(MIN_CHARS_PER_TOKEN, n));
+}
+
+export function readCursorUsageNote(message: any): CursorUsageNote | undefined {
+  const diagnostics: any[] = Array.isArray(message?.diagnostics)
+    ? message.diagnostics
+    : [];
+  for (let i = diagnostics.length - 1; i >= 0; i--) {
+    const d = diagnostics[i];
+    if (d?.type === CURSOR_USAGE_DIAGNOSTIC && d.details) return d.details;
+  }
+  return undefined;
+}
+
+// Characters per token from the newest usage note of this Cursor model.
+// Other models use other tokenizers, so their notes do not apply.
+function chatCharsPerToken(messages: any[], modelId: string): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m?.role !== "assistant") continue;
+    if (m.stopReason === "aborted" || m.stopReason === "error") continue;
+    const note = readCursorUsageNote(m);
+    if (note?.model === modelId) return clampCharsPerToken(note.charsPerToken);
+  }
+  return DEFAULT_CHARS_PER_TOKEN;
+}
+
+export function promptChars(context: any, prompt: string): number {
+  return prompt.length + JSON.stringify(context?.tools ?? []).length;
+}
+
+// Estimate the prompt of one model call from the characters that the bridge
+// sends. pi's own estimate also counts Grok's thinking, which the bridge
+// never sends to Cursor, and it uses 4 characters per token.
+export function estimatePromptTokens(
+  context: any,
+  chars: number,
+  modelId: string,
+  images = 0,
+): { tokens: number; charsPerToken: number } {
+  const charsPerToken = chatCharsPerToken(context?.messages ?? [], modelId);
+  const tokens =
+    CURSOR_PROMPT_TOKENS +
+    chars / charsPerToken +
+    images * ESTIMATED_IMAGE_TOKENS;
+  return { tokens: Math.round(tokens), charsPerToken };
+}
+
+// The number of model calls that Cursor added up for a run. Cursor never
+// reports more finished thinking blocks than calls. Grok and Composer report
+// one for each call, other models report fewer or none. Without thinking
+// blocks, take the whole number of calls that best fits the estimate.
+export function countModelCalls(
+  reportedInput: number,
+  estimate: number,
+  thinkingBlocks: number,
+  contextWindow: number,
+): number {
+  let fewest = 1;
+  if (contextWindow > 0 && reportedInput > 0) {
+    fewest = Math.max(fewest, Math.ceil(reportedInput / contextWindow));
+  }
+  const counted = Math.max(fewest, Math.floor(thinkingBlocks) || 0);
+  if (!(reportedInput > 0) || !(estimate > 0)) return counted;
+  const misfit = (calls: number) =>
+    Math.abs(Math.log(reportedInput / calls / estimate));
+  let best = fewest;
+  for (let calls = fewest + 1; calls <= MAX_MODEL_CALLS; calls++) {
+    if (misfit(calls) < misfit(best)) best = calls;
+  }
+  if (thinkingBlocks < 1) return best;
+  // Go above the thinking count only when it leaves each call at twice the
+  // estimate or more. In a replay of a real Grok chat, no estimate before a
+  // measured call was off by more than 11%.
+  return reportedInput / counted >= 2 * estimate
+    ? Math.max(counted, best)
+    : counted;
+}
+
+function setUsage(
   output: any,
-  tokenUsage: any,
+  parts: {
+    input: number;
+    output: number;
+    cacheRead: number;
+    cacheWrite: number;
+    reasoning?: number;
+  },
   model: any,
   calculateCost: any,
 ): void {
-  if (!tokenUsage) return;
-  // Cursor's inputTokens include the cached tokens. pi counts cache reads and
-  // writes apart from input, so take them out to avoid counting them twice.
-  const cacheRead = tokenUsage.cacheReadTokens ?? 0;
-  const cacheWrite = tokenUsage.cacheWriteTokens ?? 0;
-  output.usage.input = Math.max(
-    0,
-    (tokenUsage.inputTokens ?? 0) - cacheRead - cacheWrite,
-  );
-  output.usage.output = tokenUsage.outputTokens ?? 0;
-  output.usage.cacheRead = cacheRead;
-  output.usage.cacheWrite = cacheWrite;
+  output.usage.input = Math.max(0, Math.round(parts.input));
+  output.usage.output = Math.max(0, Math.round(parts.output));
+  output.usage.cacheRead = Math.max(0, Math.round(parts.cacheRead));
+  output.usage.cacheWrite = Math.max(0, Math.round(parts.cacheWrite));
+  if (parts.reasoning !== undefined) {
+    output.usage.reasoning = Math.max(0, Math.round(parts.reasoning));
+  }
   output.usage.totalTokens =
-    output.usage.input + output.usage.output + cacheRead + cacheWrite;
+    output.usage.input +
+    output.usage.output +
+    output.usage.cacheRead +
+    output.usage.cacheWrite;
   try {
     calculateCost(model, output.usage);
   } catch {
@@ -492,92 +617,108 @@ function applyUsage(
   }
 }
 
-// Same value as pi's own context estimate.
-const ESTIMATED_IMAGE_CHARS = 4800;
-
-function contentChars(content: unknown): number {
-  if (typeof content === "string") return content.length;
-  if (!Array.isArray(content)) return 0;
-  let chars = 0;
-  for (const block of content) {
-    if (block?.type === "text") chars += block.text?.length ?? 0;
-    else if (block?.type === "thinking") chars += block.thinking?.length ?? 0;
-    else if (block?.type === "toolCall") {
-      chars +=
-        (block.name?.length ?? 0) + JSON.stringify(block.arguments ?? {}).length;
-    } else if (block?.type === "image") chars += ESTIMATED_IMAGE_CHARS;
-  }
-  return chars;
-}
-
-function usageTokens(usage: any): number {
-  if (!usage) return 0;
-  return (
-    usage.totalTokens ||
-    (usage.input ?? 0) +
-      (usage.output ?? 0) +
-      (usage.cacheRead ?? 0) +
-      (usage.cacheWrite ?? 0)
-  );
-}
-
-// Cursor adds its own agent prompt, which the bridge cannot see. Live runs
-// with pi's default tools measured 3,400 to 4,300 tokens more than the
-// estimate of the prompt that the bridge sends.
-const CURSOR_PROMPT_TOKENS = 4000;
-
-// Cursor reports usage only when a run ends. A turn that hands a tool call to
-// pi cancels its run, so Cursor reports nothing for that turn. Estimate it the
-// way pi estimates context: the last reported usage, plus one token for each
-// 4 characters after it.
-export function estimateTurnUsage(
-  context: any,
-  content: unknown,
-): { input: number; output: number } {
-  const messages: any[] = (context?.messages ?? []).filter(
-    (m: any) => m?.role !== "system",
-  );
-  let chars =
-    (context?.systemPrompt?.length ?? 0) +
-    JSON.stringify(context?.tools ?? []).length;
-  for (const m of messages) chars += contentChars(m?.content);
-  let input = CURSOR_PROMPT_TOKENS + Math.ceil(chars / 4);
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (
-      m?.role !== "assistant" ||
-      m.stopReason === "aborted" ||
-      m.stopReason === "error" ||
-      !(usageTokens(m.usage) > 0)
-    ) {
-      continue;
-    }
-    let after = 0;
-    for (const later of messages.slice(i + 1)) after += contentChars(later?.content);
-    const reported = usageTokens(m.usage) + Math.ceil(after / 4);
-    // Usage from before a compaction or a branch change does not match this
-    // prompt. Use it only when it is near the full estimate. Otherwise pi
-    // could see the old size and compact again.
-    if (reported < input * 1.5 && reported > input / 1.5) input = reported;
-    break;
-  }
-  return { input, output: Math.ceil(contentChars(content) / 4) };
-}
-
-function applyEstimatedUsage(
+export function recordTurnUsage(
   output: any,
-  context: any,
-  model: any,
-  calculateCost: any,
+  turn: {
+    model: any;
+    modelId: string;
+    promptChars: number;
+    images?: number;
+    estimate: { tokens: number; charsPerToken: number };
+    reported?: any;
+    thinkingBlocks: number;
+    calculateCost: (model: any, usage: any) => void;
+  },
 ): void {
-  if (usageTokens(output.usage) > 0) return;
-  const estimate = estimateTurnUsage(context, output.content);
-  applyUsage(
-    output,
-    { inputTokens: estimate.input, outputTokens: estimate.output },
-    model,
-    calculateCost,
-  );
+  const { reported, estimate } = turn;
+  // Cursor's inputTokens include the cached tokens. pi counts cache reads and
+  // writes apart from input, so take them out to avoid counting them twice.
+  const reportedInput = Number(reported?.inputTokens) || 0;
+  let note: CursorUsageNote;
+  if (reportedInput > 0) {
+    const calls = countModelCalls(
+      reportedInput,
+      estimate.tokens,
+      turn.thinkingBlocks,
+      Number(turn.model?.contextWindow) || 0,
+    );
+    const share = (n: unknown) => (Number(n) || 0) / calls;
+    const cacheRead = share(reported.cacheReadTokens);
+    const cacheWrite = share(reported.cacheWriteTokens);
+    const promptTokens = Math.round(share(reportedInput));
+    setUsage(
+      output,
+      {
+        input: promptTokens - cacheRead - cacheWrite,
+        output: share(reported.outputTokens),
+        cacheRead,
+        cacheWrite,
+        reasoning:
+          reported.reasoningTokens === undefined
+            ? undefined
+            : share(reported.reasoningTokens),
+      },
+      turn.model,
+      turn.calculateCost,
+    );
+    const textTokens =
+      promptTokens -
+      CURSOR_PROMPT_TOKENS -
+      (turn.images ?? 0) * ESTIMATED_IMAGE_TOKENS;
+    note = {
+      source: "measured",
+      model: turn.modelId,
+      promptChars: turn.promptChars,
+      promptTokens,
+      charsPerToken:
+        textTokens > 0
+          ? clampCharsPerToken(turn.promptChars / textTokens)
+          : estimate.charsPerToken,
+      modelCalls: calls,
+    };
+  } else {
+    // The next prompt holds the text and the tool calls of this turn, but
+    // not its thinking.
+    const completion = formatMessage(output).length;
+    setUsage(
+      output,
+      {
+        input: estimate.tokens,
+        output: completion / estimate.charsPerToken,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+      turn.model,
+      turn.calculateCost,
+    );
+    note = {
+      source: "estimated",
+      model: turn.modelId,
+      promptChars: turn.promptChars,
+      promptTokens: estimate.tokens,
+      charsPerToken: estimate.charsPerToken,
+    };
+  }
+  if (reported) {
+    note.reported = {};
+    for (const key of [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+      "reasoningTokens",
+    ]) {
+      if (typeof reported[key] === "number") note.reported[key] = reported[key];
+    }
+  }
+  output.diagnostics = [
+    ...(Array.isArray(output.diagnostics) ? output.diagnostics : []),
+    {
+      type: CURSOR_USAGE_DIAGNOSTIC,
+      timestamp: Date.now(),
+      details: { ...note },
+    },
+  ];
 }
 
 function makeBlockAppenders(output: any, stream: any) {
@@ -768,11 +909,33 @@ export function runCursorTurn(opts: {
         if (replaced && typeof replaced === "object") payload = replaced;
       }
       prompt = payload.text ?? prompt;
+      const cursorModelId = payload.modelId ?? modelId;
+      const chars = promptChars(context, prompt);
+      const imageCount = payload.images?.length ?? 0;
+      const estimate = estimatePromptTokens(
+        context,
+        chars,
+        cursorModelId,
+        imageCount,
+      );
+      let reported: any;
+      let thinkingBlocks = 0;
+      const recordUsage = () =>
+        recordTurnUsage(output, {
+          model,
+          modelId: cursorModelId,
+          promptChars: chars,
+          images: imageCount,
+          estimate,
+          reported,
+          thinkingBlocks,
+          calculateCost: deps.calculateCost,
+        });
 
       configureCursorRipgrepPath();
       agent = await createAgent({
         model: {
-          id: payload.modelId ?? modelId,
+          id: cursorModelId,
           ...(payload.params?.length ? { params: payload.params } : {}),
         },
         apiKey,
@@ -792,7 +955,14 @@ export function runCursorTurn(opts: {
       const userMessage = payload.images?.length
         ? { text: prompt, images: payload.images }
         : prompt;
-      run = await agent.send(userMessage, {});
+      run = await agent.send(userMessage, {
+        onDelta: ({ update }: any) => {
+          if (update?.type === "thinking-completed") thinkingBlocks++;
+          else if (update?.type === "turn-ended" && update.usage) {
+            reported = update.usage;
+          }
+        },
+      });
 
       const onAbort = () => {
         handoff.abort();
@@ -826,8 +996,8 @@ export function runCursorTurn(opts: {
             remember([call]);
             requestHandoff();
           }
-        } else if (msg?.type === "usage") {
-          applyUsage(output, msg.usage, model, deps.calculateCost);
+        } else if (msg?.type === "usage" && msg.usage) {
+          reported = msg.usage;
         }
       }
 
@@ -837,12 +1007,11 @@ export function runCursorTurn(opts: {
       } catch {
         result = undefined;
       }
-      if (result?.usage)
-        applyUsage(output, result.usage, model, deps.calculateCost);
+      if (result?.usage) reported = result.usage;
 
       if (captured.length) {
         blocks.emitToolCalls(captured);
-        applyEstimatedUsage(output, context, model, deps.calculateCost);
+        recordUsage();
         output.stopReason = "toolUse";
         stream.push({ type: "done", reason: "toolUse", message: output });
       } else if (options?.signal?.aborted || result?.status === "cancelled") {
@@ -854,7 +1023,7 @@ export function runCursorTurn(opts: {
       } else if (result?.status === "finished" || !result) {
         blocks.closeThinking();
         blocks.closeText();
-        applyEstimatedUsage(output, context, model, deps.calculateCost);
+        recordUsage();
         output.stopReason = "stop";
         stream.push({ type: "done", reason: "stop", message: output });
       } else {

@@ -23,6 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Estimate usage for a turn that hands a tool call to pi. Cursor reports usage only when a run ends, so these turns had zero usage, and context gauges such as `pi-minimal-footer` showed an empty context. The estimate adds Cursor's own agent prompt and ignores usage from before a compaction.
 - Count Cursor's cached input tokens once. Cursor's `inputTokens` include `cacheReadTokens`, so pi showed too many tokens when Cursor used its cache.
 - Keep a cached model id, such as `grok-4.7`, until the live catalog loads. pi print mode never loads it, and interactive mode loads it a short time after start-up. Before this fix, such ids mapped to `default`, so Cursor ran its Auto model.
+- Record the usage of one model call. Cursor reports the sum of all model calls in a run, and the first tool use adds a hidden call that loads the tool schemas. A Grok turn with two calls of about 151,000 tokens showed 304,372 tokens, so pi compacted the chat at 59% of the context window.
+- Estimate a tool-call turn from the characters that the bridge sends, with the characters per token of the last measured call. The estimate no longer counts Grok's thinking, which the bridge does not send. Each Cursor message keeps a `cursor_usage` diagnostic with the values.
 
 ## [0.2.3] - 2026-09-04
 

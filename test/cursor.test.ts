@@ -19,7 +19,10 @@ import {
   toPiModel,
   CURSOR_API,
   CURSOR_COMPAT_SOURCE_ID,
-  estimateTurnUsage,
+  countModelCalls,
+  estimatePromptTokens,
+  promptChars,
+  readCursorUsageNote,
   createCursorCompatApiProvider,
   configureCursorRipgrepPath,
 } from "../src/cursor-core.ts";
@@ -539,9 +542,55 @@ test("runCursorTurn unwraps Cursor MCP tool calls into pi tool names", async () 
   assert.equal(toolCalls[0].arguments.path, "package.json");
 });
 
+// A fake Cursor agent. The run sends onDelta updates, then streams messages.
+function fakeCursorAgent(run: {
+  thinkingBlocks?: number;
+  messages?: any[];
+  usage?: any;
+  status?: string;
+}) {
+  let created: any;
+  const createAgent = async (opts: any) => {
+    created = opts;
+    return {
+      send: async (_message: any, sendOptions: any) => {
+        for (let i = 0; i < (run.thinkingBlocks ?? 0); i++) {
+          sendOptions?.onDelta?.({ update: { type: "thinking-completed" } });
+        }
+        if (run.usage) {
+          sendOptions?.onDelta?.({ update: { type: "turn-ended", usage: run.usage } });
+        }
+        return {
+          stream: async function* () {
+            for (const message of run.messages ?? []) yield message;
+            if (run.usage) yield { type: "usage", usage: run.usage };
+          },
+          cancel: async () => {},
+          wait: async () => ({ status: run.status ?? "finished", usage: run.usage }),
+        };
+      },
+      close: () => {},
+    };
+  };
+  return { createAgent, created: () => created };
+}
+
+async function runTurn(model: any, context: any, agent: { createAgent: any }) {
+  const stream = fakeStream();
+  runCursorTurn({
+    model,
+    context,
+    apiKey: "test-key",
+    deps: { createStream: () => stream, calculateCost: () => {}, createAgent: agent.createAgent },
+  });
+  await stream.closed;
+  return stream.events.find((e) => e.type === "done");
+}
+
+const grok = { id: "grok-4.7", api: "cursor-sdk", provider: "cursor", contextWindow: 256000 };
+
 test("runCursorTurn counts Cursor's cached input tokens once", async () => {
   setKnownModelIds(["default"]);
-  const stream = fakeStream();
   // Cursor's inputTokens include cacheReadTokens, and its totalTokens counts them twice.
   const usage = {
     inputTokens: 4635,
@@ -550,93 +599,149 @@ test("runCursorTurn counts Cursor's cached input tokens once", async () => {
     cacheWriteTokens: 0,
     totalTokens: 7825,
   };
-  const createAgent = async () => ({
-    send: async () => ({
-      stream: async function* () {
-        yield { type: "assistant", message: { content: [{ type: "text", text: "ok" }] } };
-        yield { type: "usage", usage };
-      },
-      cancel: async () => {},
-      wait: async () => ({ status: "finished", usage }),
-    }),
-    close: () => {},
+  const agent = fakeCursorAgent({
+    thinkingBlocks: 1,
+    usage,
+    messages: [{ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }],
   });
+  const done = await runTurn(
+    { id: "default", api: "cursor-sdk", provider: "cursor" },
+    { messages: [{ role: "user", content: "hi" }] },
+    agent,
+  );
 
-  runCursorTurn({
-    model: { id: "default", api: "cursor-sdk", provider: "cursor" },
-    context: { messages: [{ role: "user", content: "hi" }] },
-    apiKey: "test-key",
-    deps: { createStream: () => stream, calculateCost: () => {}, createAgent },
-  });
-  await stream.closed;
-
-  const done = stream.events.find((e) => e.type === "done");
   assert.equal(done.reason, "stop");
   assert.equal(done.message.usage.input, 2075);
   assert.equal(done.message.usage.cacheRead, 2560);
   assert.equal(done.message.usage.output, 630);
   assert.equal(done.message.usage.totalTokens, 5265);
+  const note = readCursorUsageNote(done.message);
+  assert.equal(note?.source, "measured");
+  assert.equal(note?.modelCalls, 1);
+  assert.equal(note?.promptTokens, 4635);
+  assert.equal(note?.model, "default");
 });
 
-test("estimateTurnUsage starts from the last usage that Cursor reported", () => {
-  const reported = (total: number) => ({
-    role: "assistant",
-    stopReason: "toolUse",
-    content: [{ type: "toolCall", id: "c1", name: "read", arguments: {} }],
-    usage: { input: total, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: total },
+test("runCursorTurn divides Cursor's summed usage by the model calls", async () => {
+  setKnownModelIds(["grok-4.7"]);
+  // Usage of the 304k turn in a real chat: two calls of about 151,000 tokens.
+  const usage = {
+    inputTokens: 301999,
+    outputTokens: 2373,
+    cacheReadTokens: 152704,
+    cacheWriteTokens: 0,
+    reasoningTokens: 1000,
+  };
+  const agent = fakeCursorAgent({
+    thinkingBlocks: 2,
+    usage,
+    messages: [{ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } }],
   });
-  const context = (anchor: any) => ({
-    systemPrompt: "s".repeat(4000),
-    tools: [],
-    messages: [
-      { role: "system", content: "ignored" },
-      { role: "user", content: "u".repeat(4000) },
-      anchor,
-      { role: "toolResult", content: [{ type: "text", text: "x".repeat(400) }] },
-      { ...anchor, stopReason: "aborted", usage: { totalTokens: 99999 } },
-    ],
-  });
-  // Full estimate: 4,000 for Cursor's own prompt, plus (4,000 + 2 + 4,000 + 6 + 400 + 6) / 4.
-  const full = 4000 + Math.ceil(8414 / 4);
-
-  // 6,000 reported tokens, then (400 + 6) / 4 for the later messages.
-  const fresh = estimateTurnUsage(context(reported(6000)), [{ type: "text", text: "y".repeat(80) }]);
-  assert.deepEqual(fresh, { input: 6102, output: 20 });
-
-  // Usage from before a compaction is far from the full estimate, so it is not used.
-  assert.deepEqual(estimateTurnUsage(context(reported(180000)), []), { input: full, output: 0 });
-
-  // No usage yet: Cursor's own prompt, then the prompt, the tool schemas ("[]"), and the messages.
-  const first = estimateTurnUsage(
-    { systemPrompt: "p".repeat(40), tools: [], messages: [{ role: "user", content: "u".repeat(58) }] },
-    [],
+  const done = await runTurn(
+    grok,
+    { systemPrompt: "x".repeat(510000), messages: [{ role: "user", content: "go" }] },
+    agent,
   );
-  assert.deepEqual(first, { input: 4025, output: 0 });
+
+  assert.equal(done.reason, "stop");
+  assert.equal(done.message.usage.input, 74648);
+  assert.equal(done.message.usage.cacheRead, 76352);
+  assert.equal(done.message.usage.output, 1187);
+  assert.equal(done.message.usage.reasoning, 500);
+  assert.equal(done.message.usage.totalTokens, 152187);
+  const note = readCursorUsageNote(done.message);
+  assert.equal(note?.modelCalls, 2);
+  assert.equal(note?.promptTokens, 151000);
+  assert.equal(note?.reported?.inputTokens, 301999);
 });
 
-test("runCursorTurn estimates usage for a turn that hands a tool call to pi", async () => {
-  setKnownModelIds(["default"]);
-  const stream = fakeStream();
-  const createAgent = async () => ({
-    send: async () => ({
-      stream: async function* () {
-        yield {
-          type: "assistant",
-          message: {
-            content: [
-              { type: "tool_use", id: "c1", name: "read", input: { path: "package.json" } },
-            ],
-          },
-        };
-      },
-      cancel: async () => {},
-      wait: async () => ({ status: "cancelled" }),
-    }),
-    close: () => {},
+test("countModelCalls trusts Grok's thinking count and fits other models to the estimate", () => {
+  // Grok and Composer finish one thinking block for each call.
+  assert.equal(countModelCalls(301999, 150000, 2, 256000), 2);
+  assert.equal(countModelCalls(150000, 90000, 1, 256000), 1);
+  // GPT finished one thinking block for three calls.
+  assert.equal(countModelCalls(25230, 8400, 1, 256000), 3);
+  // Claude finished no thinking blocks.
+  assert.equal(countModelCalls(34419, 11400, 0, 256000), 3);
+  assert.equal(countModelCalls(11314, 11400, 0, 256000), 1);
+  // One call cannot be larger than the context window.
+  assert.equal(countModelCalls(600000, 0, 0, 256000), 3);
+});
+
+const noteMessage = (model: string, charsPerToken: number, extra: any = {}) => ({
+  role: "assistant",
+  stopReason: "toolUse",
+  content: [],
+  usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 },
+  diagnostics: [
+    {
+      type: "cursor_usage",
+      timestamp: 0,
+      details: { source: "measured", model, promptChars: 1, promptTokens: 1, charsPerToken },
+    },
+  ],
+  ...extra,
+});
+
+test("estimatePromptTokens uses the newest usage note of the same Cursor model", () => {
+  const context = {
+    messages: [
+      { role: "user", content: "u" },
+      noteMessage("grok-4.7", 3.0),
+      noteMessage("composer-2.5", 4.5),
+      noteMessage("grok-4.7", 2.6, { stopReason: "aborted" }),
+    ],
+  };
+  // 4,000 for Cursor's own prompt, then 300,000 characters at 3 per token.
+  assert.deepEqual(estimatePromptTokens(context, 300000, "grok-4.7"), {
+    tokens: 104000,
+    charsPerToken: 3.0,
   });
+  assert.equal(estimatePromptTokens(context, 300000, "grok-4.7", 2).tokens, 106400);
+  // Another model uses another tokenizer, so it starts from 3.5.
+  assert.equal(estimatePromptTokens(context, 300000, "gpt-5.5").charsPerToken, 3.5);
+
+  // Usage from before this fix has no note. Its summed values are not used.
+  const legacy = {
+    messages: [
+      {
+        role: "assistant",
+        stopReason: "stop",
+        content: [],
+        usage: { input: 149295, output: 2373, cacheRead: 152704, cacheWrite: 0, totalTokens: 304372 },
+      },
+    ],
+  };
+  assert.equal(estimatePromptTokens(legacy, 350000, "grok-4.7").tokens, 104000);
+});
+
+test("a measured turn sets the characters per token for the chat", async () => {
+  setKnownModelIds(["grok-4.7"]);
+  const context = { systemPrompt: "y".repeat(300000), messages: [{ role: "user", content: "go" }] };
+  const chars = promptChars(resolveTurnContext(context), buildHarnessPrompt(resolveTurnContext(context)));
+  const agent = fakeCursorAgent({
+    thinkingBlocks: 1,
+    usage: { inputTokens: 104000, outputTokens: 10, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    messages: [{ type: "assistant", message: { content: [{ type: "text", text: "ok" }] } }],
+  });
+  const done = await runTurn(grok, context, agent);
+  const note = readCursorUsageNote(done.message);
+  assert.equal(note?.source, "measured");
+  assert.equal(note?.promptChars, chars);
+  assert.equal(note?.charsPerToken, chars / 100000);
+});
+
+test("runCursorTurn estimates a turn that hands a tool call to pi", async () => {
+  setKnownModelIds(["grok-4.7"]);
   const context = {
     systemPrompt: "Use pi tools.",
-    messages: [{ role: "user", content: "read package.json" }],
+    messages: [
+      { role: "user", content: "read package.json" },
+      noteMessage("grok-4.7", 3.0, {
+        content: [{ type: "thinking", thinking: "t".repeat(90000) }, { type: "text", text: "Reading." }],
+      }),
+      { role: "user", content: "and again" },
+    ],
     tools: [
       {
         name: "read",
@@ -645,22 +750,36 @@ test("runCursorTurn estimates usage for a turn that hands a tool call to pi", as
       },
     ],
   };
-
-  runCursorTurn({
-    model: { id: "default", api: "cursor-sdk", provider: "cursor" },
-    context,
-    apiKey: "test-key",
-    deps: { createStream: () => stream, calculateCost: () => {}, createAgent },
+  const agent = fakeCursorAgent({
+    status: "cancelled",
+    messages: [
+      { type: "thinking", text: "z".repeat(9000) },
+      {
+        type: "assistant",
+        message: {
+          content: [{ type: "tool_use", id: "c1", name: "read", input: { path: "package.json" } }],
+        },
+      },
+    ],
   });
-  await stream.closed;
+  const done = await runTurn(grok, context, agent);
 
-  const done = stream.events.find((e) => e.type === "done");
   assert.equal(done.reason, "toolUse");
-  const expected = estimateTurnUsage(context, done.message.content);
-  assert.ok(expected.input > 0 && expected.output > 0);
-  assert.equal(done.message.usage.input, expected.input);
-  assert.equal(done.message.usage.output, expected.output);
-  assert.equal(done.message.usage.totalTokens, expected.input + expected.output);
+  const turn = resolveTurnContext(context);
+  const expected = estimatePromptTokens(context, promptChars(turn, buildHarnessPrompt(turn)), "grok-4.7");
+  assert.equal(expected.charsPerToken, 3.0);
+  // The 90,000 characters of earlier thinking are not in the prompt, so they add nothing.
+  assert.ok(expected.tokens < 4300, `estimate ${expected.tokens}`);
+  assert.equal(done.message.usage.input, expected.tokens);
+  // The output counts the tool call, not the 9,000 characters of thinking.
+  assert.ok(done.message.usage.output > 0 && done.message.usage.output < 30);
+  assert.equal(
+    done.message.usage.totalTokens,
+    done.message.usage.input + done.message.usage.output,
+  );
+  const note = readCursorUsageNote(done.message);
+  assert.equal(note?.source, "estimated");
+  assert.equal(note?.promptTokens, expected.tokens);
 });
 
 test("runCursorTurn disables Cursor tools when pi has none", async () => {
