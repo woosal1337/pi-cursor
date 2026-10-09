@@ -50,7 +50,7 @@ A GitHub push and an npm publish are separate operations. Never claim the packag
 - Stream Cursor chunks into **one** pi text block per turn (words must be joined with spaces).
 - `auto` and `auto-smart` map to `cursor/default`. After the live catalog loads, other unknown model ids also map to `cursor/default`. Before it loads, keep the requested id, because pi's cached catalog came from Cursor.
 - Send `fast` and `context` on every request. The base model sends `fast=false`, and its `-fast` copy sends `fast=true`. Use the smallest context option, and set `contextWindow` to match it.
-- Record the usage of one model call on each message, never Cursor's sum for the run. pi reads it as the size of the context. Keep the `cursor_usage` diagnostic, because later estimates read its characters per token.
+- Record the prompt of one model call on each message, never Cursor's sum for the run. pi reads it as the size of the context. Record the full output of the run, because the model generated all of it. Keep the `cursor_usage` diagnostic, because later estimates read its characters per token and its output per streamed token.
 - API key order: `options.apiKey` from pi auth, then `CURSOR_API_KEY`.
 - Do not commit secrets (`.env`, `.cursor-key`, keys in `auth.json`).
 - Public docs live in `README.md`. Follow pi's real CLI (`pi install npm:…`, `pi uninstall`, `/login`, `/model` + Ctrl+S).
