@@ -20,6 +20,7 @@ import {
   CURSOR_API,
   CURSOR_COMPAT_SOURCE_ID,
   countModelCalls,
+  weighOutputRatio,
   estimatePromptTokens,
   promptChars,
   readCursorUsageNote,
@@ -659,7 +660,9 @@ test("runCursorTurn divides the prompt by the model calls and keeps the full out
   assert.equal(note?.promptTokens, 151000);
   assert.equal(note?.reported?.inputTokens, 301999);
   assert.equal(note?.streamedTokens, 1191);
-  assert.equal(note?.outputPerStreamedToken, 2373 / 1191);
+  // A chat starts at 1 output token for each streamed token, with a weight of 200.
+  assert.equal(note?.outputPerStreamedToken, (200 + 2373) / (200 + 1191));
+  assert.equal(note?.outputRatioWeight, 1391);
 });
 
 test("countModelCalls trusts Grok's thinking count and fits other models to the estimate", () => {
@@ -691,11 +694,26 @@ const noteMessage = (model: string, charsPerToken: number, extra: any = {}, outp
         promptTokens: 1,
         charsPerToken,
         outputPerStreamedToken,
+        outputRatioWeight: 3000,
         streamedTokens: 0,
       },
     },
   ],
   ...extra,
+});
+
+test("weighOutputRatio weights each run by its streamed tokens", () => {
+  // A long reply: 8,551 output tokens for 2,993 streamed ones.
+  const essay = weighOutputRatio({ outputPerStreamedToken: 1, outputRatioWeight: 200 }, 2993, 8551);
+  assert.equal(essay.outputPerStreamedToken, (200 + 8551) / (200 + 2993));
+  assert.equal(essay.outputRatioWeight, 3193);
+  // A short reply with much hidden reasoning: 307 output tokens for 20 streamed ones.
+  const done = weighOutputRatio(essay, 20, 307);
+  assert.ok(Math.abs(done.outputPerStreamedToken - 2.8) < 0.1, `ratio ${done.outputPerStreamedToken}`);
+  // A run without streamed counts keeps the ratio.
+  assert.deepEqual(weighOutputRatio(done, 0, 500), done);
+  // The weight stops at 20,000 streamed tokens, so the ratio can follow a new effort level.
+  assert.equal(weighOutputRatio({ outputPerStreamedToken: 2, outputRatioWeight: 19900 }, 500, 500).outputRatioWeight, 20000);
 });
 
 test("estimatePromptTokens uses the newest usage note of the same Cursor model", () => {
@@ -712,6 +730,7 @@ test("estimatePromptTokens uses the newest usage note of the same Cursor model",
     tokens: 104000,
     charsPerToken: 3.0,
     outputPerStreamedToken: 1,
+    outputRatioWeight: 3000,
   });
   assert.equal(estimatePromptTokens(context, 300000, "grok-4.7", 2).tokens, 106400);
   // Another model uses another tokenizer, so it starts from 3.5.

@@ -478,7 +478,8 @@ function makeInitialMessage(model: any): any {
 //
 // Cursor streams token counts while it generates, but Grok streams only part
 // of its reasoning. A turn that hands a tool call to pi multiplies the
-// streamed count by the ratio of reported to streamed output of the last run.
+// streamed count by the ratio of reported to streamed output of the earlier
+// runs, weighted by their streamed tokens.
 const CURSOR_USAGE_DIAGNOSTIC = "cursor_usage";
 
 // Characters per token before the first measurement in a chat. Live Grok
@@ -497,6 +498,8 @@ const ESTIMATED_IMAGE_TOKENS = 1200;
 const MAX_MODEL_CALLS = 16;
 
 const MAX_OUTPUT_PER_STREAMED_TOKEN = 5;
+const OUTPUT_RATIO_START_WEIGHT = 200;
+const MAX_OUTPUT_RATIO_WEIGHT = 20_000;
 
 export interface CursorUsageNote {
   source: "measured" | "estimated";
@@ -507,6 +510,7 @@ export interface CursorUsageNote {
   promptTokens: number;
   charsPerToken: number;
   outputPerStreamedToken: number;
+  outputRatioWeight: number;
   streamedTokens: number;
   modelCalls?: number;
   // Cursor's sums for the whole run.
@@ -563,8 +567,14 @@ export function estimatePromptTokens(
   chars: number,
   modelId: string,
   images = 0,
-): { tokens: number; charsPerToken: number; outputPerStreamedToken: number } {
+): {
+  tokens: number;
+  charsPerToken: number;
+  outputPerStreamedToken: number;
+  outputRatioWeight: number;
+} {
   const note = latestUsageNote(context?.messages ?? [], modelId);
+  const weight = Number(note?.outputRatioWeight);
   const charsPerToken = clampCharsPerToken(note?.charsPerToken);
   const tokens =
     CURSOR_PROMPT_TOKENS +
@@ -576,6 +586,10 @@ export function estimatePromptTokens(
     outputPerStreamedToken: clampOutputPerStreamedToken(
       note?.outputPerStreamedToken,
     ),
+    outputRatioWeight:
+      weight > 0
+        ? Math.min(MAX_OUTPUT_RATIO_WEIGHT, weight)
+        : OUTPUT_RATIO_START_WEIGHT,
   };
 }
 
@@ -641,6 +655,28 @@ function setUsage(
   }
 }
 
+export function weighOutputRatio(
+  previous: { outputPerStreamedToken: number; outputRatioWeight: number },
+  streamedTokens: number,
+  reportedOutput: number,
+): { outputPerStreamedToken: number; outputRatioWeight: number } {
+  if (!(streamedTokens > 0) || !(reportedOutput > 0)) {
+    return {
+      outputPerStreamedToken: previous.outputPerStreamedToken,
+      outputRatioWeight: previous.outputRatioWeight,
+    };
+  }
+  const weight = previous.outputRatioWeight + streamedTokens;
+  return {
+    outputPerStreamedToken: clampOutputPerStreamedToken(
+      (previous.outputPerStreamedToken * previous.outputRatioWeight +
+        reportedOutput) /
+        weight,
+    ),
+    outputRatioWeight: Math.min(MAX_OUTPUT_RATIO_WEIGHT, weight),
+  };
+}
+
 export function recordTurnUsage(
   output: any,
   turn: {
@@ -652,6 +688,7 @@ export function recordTurnUsage(
       tokens: number;
       charsPerToken: number;
       outputPerStreamedToken: number;
+      outputRatioWeight: number;
     };
     reported?: any;
     thinkingBlocks: number;
@@ -704,10 +741,7 @@ export function recordTurnUsage(
         textTokens > 0
           ? clampCharsPerToken(turn.promptChars / textTokens)
           : estimate.charsPerToken,
-      outputPerStreamedToken:
-        turn.streamedTokens > 0 && reportedOutput > 0
-          ? clampOutputPerStreamedToken(reportedOutput / turn.streamedTokens)
-          : estimate.outputPerStreamedToken,
+      ...weighOutputRatio(estimate, turn.streamedTokens, reportedOutput),
       streamedTokens: turn.streamedTokens,
       modelCalls: calls,
     };
@@ -739,6 +773,7 @@ export function recordTurnUsage(
       promptTokens: estimate.tokens,
       charsPerToken: estimate.charsPerToken,
       outputPerStreamedToken: estimate.outputPerStreamedToken,
+      outputRatioWeight: estimate.outputRatioWeight,
       streamedTokens: turn.streamedTokens,
     };
   }
