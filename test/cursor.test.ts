@@ -545,6 +545,7 @@ test("runCursorTurn unwraps Cursor MCP tool calls into pi tool names", async () 
 // A fake Cursor agent. The run sends onDelta updates, then streams messages.
 function fakeCursorAgent(run: {
   thinkingBlocks?: number;
+  tokenDeltas?: number[];
   messages?: any[];
   usage?: any;
   status?: string;
@@ -556,6 +557,9 @@ function fakeCursorAgent(run: {
       send: async (_message: any, sendOptions: any) => {
         for (let i = 0; i < (run.thinkingBlocks ?? 0); i++) {
           sendOptions?.onDelta?.({ update: { type: "thinking-completed" } });
+        }
+        for (const tokens of run.tokenDeltas ?? []) {
+          sendOptions?.onDelta?.({ update: { type: "token-delta", tokens } });
         }
         if (run.usage) {
           sendOptions?.onDelta?.({ update: { type: "turn-ended", usage: run.usage } });
@@ -622,7 +626,7 @@ test("runCursorTurn counts Cursor's cached input tokens once", async () => {
   assert.equal(note?.model, "default");
 });
 
-test("runCursorTurn divides Cursor's summed usage by the model calls", async () => {
+test("runCursorTurn divides the prompt by the model calls and keeps the full output", async () => {
   setKnownModelIds(["grok-4.7"]);
   // Usage of the 304k turn in a real chat: two calls of about 151,000 tokens.
   const usage = {
@@ -634,6 +638,7 @@ test("runCursorTurn divides Cursor's summed usage by the model calls", async () 
   };
   const agent = fakeCursorAgent({
     thinkingBlocks: 2,
+    tokenDeltas: [700, 491],
     usage,
     messages: [{ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } }],
   });
@@ -646,13 +651,15 @@ test("runCursorTurn divides Cursor's summed usage by the model calls", async () 
   assert.equal(done.reason, "stop");
   assert.equal(done.message.usage.input, 74648);
   assert.equal(done.message.usage.cacheRead, 76352);
-  assert.equal(done.message.usage.output, 1187);
-  assert.equal(done.message.usage.reasoning, 500);
-  assert.equal(done.message.usage.totalTokens, 152187);
+  assert.equal(done.message.usage.output, 2373);
+  assert.equal(done.message.usage.reasoning, 1000);
+  assert.equal(done.message.usage.totalTokens, 153373);
   const note = readCursorUsageNote(done.message);
   assert.equal(note?.modelCalls, 2);
   assert.equal(note?.promptTokens, 151000);
   assert.equal(note?.reported?.inputTokens, 301999);
+  assert.equal(note?.streamedTokens, 1191);
+  assert.equal(note?.outputPerStreamedToken, 2373 / 1191);
 });
 
 test("countModelCalls trusts Grok's thinking count and fits other models to the estimate", () => {
@@ -668,7 +675,7 @@ test("countModelCalls trusts Grok's thinking count and fits other models to the 
   assert.equal(countModelCalls(600000, 0, 0, 256000), 3);
 });
 
-const noteMessage = (model: string, charsPerToken: number, extra: any = {}) => ({
+const noteMessage = (model: string, charsPerToken: number, extra: any = {}, outputPerStreamedToken = 1) => ({
   role: "assistant",
   stopReason: "toolUse",
   content: [],
@@ -677,7 +684,15 @@ const noteMessage = (model: string, charsPerToken: number, extra: any = {}) => (
     {
       type: "cursor_usage",
       timestamp: 0,
-      details: { source: "measured", model, promptChars: 1, promptTokens: 1, charsPerToken },
+      details: {
+        source: "measured",
+        model,
+        promptChars: 1,
+        promptTokens: 1,
+        charsPerToken,
+        outputPerStreamedToken,
+        streamedTokens: 0,
+      },
     },
   ],
   ...extra,
@@ -696,6 +711,7 @@ test("estimatePromptTokens uses the newest usage note of the same Cursor model",
   assert.deepEqual(estimatePromptTokens(context, 300000, "grok-4.7"), {
     tokens: 104000,
     charsPerToken: 3.0,
+    outputPerStreamedToken: 1,
   });
   assert.equal(estimatePromptTokens(context, 300000, "grok-4.7", 2).tokens, 106400);
   // Another model uses another tokenizer, so it starts from 3.5.
@@ -731,37 +747,41 @@ test("a measured turn sets the characters per token for the chat", async () => {
   assert.equal(note?.charsPerToken, chars / 100000);
 });
 
+const toolTurnContext = (outputPerStreamedToken: number) => ({
+  systemPrompt: "Use pi tools.",
+  messages: [
+    { role: "user", content: "read package.json" },
+    noteMessage(
+      "grok-4.7",
+      3.0,
+      { content: [{ type: "thinking", thinking: "t".repeat(90000) }, { type: "text", text: "Reading." }] },
+      outputPerStreamedToken,
+    ),
+    { role: "user", content: "and again" },
+  ],
+  tools: [
+    {
+      name: "read",
+      description: "Read a file",
+      parameters: { type: "object", properties: { path: { type: "string" } } },
+    },
+  ],
+});
+
+const toolTurnMessages = [
+  { type: "thinking", text: "z".repeat(9000) },
+  {
+    type: "assistant",
+    message: {
+      content: [{ type: "tool_use", id: "c1", name: "read", input: { path: "package.json" } }],
+    },
+  },
+];
+
 test("runCursorTurn estimates a turn that hands a tool call to pi", async () => {
   setKnownModelIds(["grok-4.7"]);
-  const context = {
-    systemPrompt: "Use pi tools.",
-    messages: [
-      { role: "user", content: "read package.json" },
-      noteMessage("grok-4.7", 3.0, {
-        content: [{ type: "thinking", thinking: "t".repeat(90000) }, { type: "text", text: "Reading." }],
-      }),
-      { role: "user", content: "and again" },
-    ],
-    tools: [
-      {
-        name: "read",
-        description: "Read a file",
-        parameters: { type: "object", properties: { path: { type: "string" } } },
-      },
-    ],
-  };
-  const agent = fakeCursorAgent({
-    status: "cancelled",
-    messages: [
-      { type: "thinking", text: "z".repeat(9000) },
-      {
-        type: "assistant",
-        message: {
-          content: [{ type: "tool_use", id: "c1", name: "read", input: { path: "package.json" } }],
-        },
-      },
-    ],
-  });
+  const context = toolTurnContext(2);
+  const agent = fakeCursorAgent({ status: "cancelled", tokenDeltas: [120, 90], messages: toolTurnMessages });
   const done = await runTurn(grok, context, agent);
 
   assert.equal(done.reason, "toolUse");
@@ -771,15 +791,26 @@ test("runCursorTurn estimates a turn that hands a tool call to pi", async () => 
   // The 90,000 characters of earlier thinking are not in the prompt, so they add nothing.
   assert.ok(expected.tokens < 4300, `estimate ${expected.tokens}`);
   assert.equal(done.message.usage.input, expected.tokens);
-  // The output counts the tool call, not the 9,000 characters of thinking.
-  assert.ok(done.message.usage.output > 0 && done.message.usage.output < 30);
-  assert.equal(
-    done.message.usage.totalTokens,
-    done.message.usage.input + done.message.usage.output,
-  );
+  // 210 streamed tokens, and the last run reported 2 output tokens for each streamed token.
+  assert.equal(done.message.usage.output, 420);
+  assert.equal(done.message.usage.reasoning, undefined);
+  assert.equal(done.message.usage.totalTokens, expected.tokens + 420);
   const note = readCursorUsageNote(done.message);
   assert.equal(note?.source, "estimated");
   assert.equal(note?.promptTokens, expected.tokens);
+  assert.equal(note?.streamedTokens, 210);
+  assert.equal(note?.outputPerStreamedToken, 2);
+});
+
+test("runCursorTurn counts thinking characters when Cursor streams no token counts", async () => {
+  setKnownModelIds(["grok-4.7"]);
+  const agent = fakeCursorAgent({ status: "cancelled", messages: toolTurnMessages });
+  const done = await runTurn(grok, toolTurnContext(2), agent);
+
+  assert.equal(done.reason, "toolUse");
+  // 9,000 characters of thinking and the tool call, at 3 characters per token.
+  assert.ok(done.message.usage.output > 3000 && done.message.usage.output < 3050, `output ${done.message.usage.output}`);
+  assert.equal(readCursorUsageNote(done.message)?.streamedTokens, 0);
 });
 
 test("runCursorTurn disables Cursor tools when pi has none", async () => {

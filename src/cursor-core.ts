@@ -471,9 +471,14 @@ function makeInitialMessage(model: any): any {
 // bridge cancels to hand a tool call to pi reports no usage.
 //
 // pi reads the last assistant message as the size of the context, so the
-// bridge records the size of one model call. Each message gets a
-// "cursor_usage" diagnostic with the prompt size in characters and tokens.
-// The next turns use its characters per token for their estimate.
+// bridge records the prompt of one model call. The output holds every token
+// that the run generated. Each message gets a "cursor_usage" diagnostic with
+// the prompt size in characters and tokens. The next turns use its
+// characters per token for their estimate.
+//
+// Cursor streams token counts while it generates, but Grok streams only part
+// of its reasoning. A turn that hands a tool call to pi multiplies the
+// streamed count by the ratio of reported to streamed output of the last run.
 const CURSOR_USAGE_DIAGNOSTIC = "cursor_usage";
 
 // Characters per token before the first measurement in a chat. Live Grok
@@ -491,6 +496,8 @@ const ESTIMATED_IMAGE_TOKENS = 1200;
 
 const MAX_MODEL_CALLS = 16;
 
+const MAX_OUTPUT_PER_STREAMED_TOKEN = 5;
+
 export interface CursorUsageNote {
   source: "measured" | "estimated";
   model: string;
@@ -499,6 +506,8 @@ export interface CursorUsageNote {
   // Tokens of the prompt of one model call.
   promptTokens: number;
   charsPerToken: number;
+  outputPerStreamedToken: number;
+  streamedTokens: number;
   modelCalls?: number;
   // Cursor's sums for the whole run.
   reported?: Record<string, number>;
@@ -508,6 +517,11 @@ function clampCharsPerToken(value: unknown): number {
   const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
   if (n <= 0) return DEFAULT_CHARS_PER_TOKEN;
   return Math.min(MAX_CHARS_PER_TOKEN, Math.max(MIN_CHARS_PER_TOKEN, n));
+}
+
+function clampOutputPerStreamedToken(value: unknown): number {
+  const n = typeof value === "number" && Number.isFinite(value) ? value : 0;
+  return Math.min(MAX_OUTPUT_PER_STREAMED_TOKEN, Math.max(1, n));
 }
 
 export function readCursorUsageNote(message: any): CursorUsageNote | undefined {
@@ -521,17 +535,20 @@ export function readCursorUsageNote(message: any): CursorUsageNote | undefined {
   return undefined;
 }
 
-// Characters per token from the newest usage note of this Cursor model.
-// Other models use other tokenizers, so their notes do not apply.
-function chatCharsPerToken(messages: any[], modelId: string): number {
+// The newest usage note of this Cursor model. Other models use other
+// tokenizers, so their notes do not apply.
+function latestUsageNote(
+  messages: any[],
+  modelId: string,
+): CursorUsageNote | undefined {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i];
     if (m?.role !== "assistant") continue;
     if (m.stopReason === "aborted" || m.stopReason === "error") continue;
     const note = readCursorUsageNote(m);
-    if (note?.model === modelId) return clampCharsPerToken(note.charsPerToken);
+    if (note?.model === modelId) return note;
   }
-  return DEFAULT_CHARS_PER_TOKEN;
+  return undefined;
 }
 
 export function promptChars(context: any, prompt: string): number {
@@ -546,13 +563,20 @@ export function estimatePromptTokens(
   chars: number,
   modelId: string,
   images = 0,
-): { tokens: number; charsPerToken: number } {
-  const charsPerToken = chatCharsPerToken(context?.messages ?? [], modelId);
+): { tokens: number; charsPerToken: number; outputPerStreamedToken: number } {
+  const note = latestUsageNote(context?.messages ?? [], modelId);
+  const charsPerToken = clampCharsPerToken(note?.charsPerToken);
   const tokens =
     CURSOR_PROMPT_TOKENS +
     chars / charsPerToken +
     images * ESTIMATED_IMAGE_TOKENS;
-  return { tokens: Math.round(tokens), charsPerToken };
+  return {
+    tokens: Math.round(tokens),
+    charsPerToken,
+    outputPerStreamedToken: clampOutputPerStreamedToken(
+      note?.outputPerStreamedToken,
+    ),
+  };
 }
 
 // The number of model calls that Cursor added up for a run. Cursor never
@@ -624,9 +648,14 @@ export function recordTurnUsage(
     modelId: string;
     promptChars: number;
     images?: number;
-    estimate: { tokens: number; charsPerToken: number };
+    estimate: {
+      tokens: number;
+      charsPerToken: number;
+      outputPerStreamedToken: number;
+    };
     reported?: any;
     thinkingBlocks: number;
+    streamedTokens: number;
     calculateCost: (model: any, usage: any) => void;
   },
 ): void {
@@ -646,17 +675,18 @@ export function recordTurnUsage(
     const cacheRead = share(reported.cacheReadTokens);
     const cacheWrite = share(reported.cacheWriteTokens);
     const promptTokens = Math.round(share(reportedInput));
+    const reportedOutput = Number(reported.outputTokens) || 0;
     setUsage(
       output,
       {
         input: promptTokens - cacheRead - cacheWrite,
-        output: share(reported.outputTokens),
+        output: reportedOutput,
         cacheRead,
         cacheWrite,
         reasoning:
           reported.reasoningTokens === undefined
             ? undefined
-            : share(reported.reasoningTokens),
+            : Number(reported.reasoningTokens) || 0,
       },
       turn.model,
       turn.calculateCost,
@@ -674,17 +704,28 @@ export function recordTurnUsage(
         textTokens > 0
           ? clampCharsPerToken(turn.promptChars / textTokens)
           : estimate.charsPerToken,
+      outputPerStreamedToken:
+        turn.streamedTokens > 0 && reportedOutput > 0
+          ? clampOutputPerStreamedToken(reportedOutput / turn.streamedTokens)
+          : estimate.outputPerStreamedToken,
+      streamedTokens: turn.streamedTokens,
       modelCalls: calls,
     };
   } else {
-    // The next prompt holds the text and the tool calls of this turn, but
-    // not its thinking.
-    const completion = formatMessage(output).length;
+    const thinkingChars = output.content.reduce(
+      (chars: number, block: any) =>
+        chars + (block?.type === "thinking" ? (block.thinking?.length ?? 0) : 0),
+      0,
+    );
+    const generated =
+      turn.streamedTokens > 0
+        ? turn.streamedTokens * estimate.outputPerStreamedToken
+        : (formatMessage(output).length + thinkingChars) / estimate.charsPerToken;
     setUsage(
       output,
       {
         input: estimate.tokens,
-        output: completion / estimate.charsPerToken,
+        output: generated,
         cacheRead: 0,
         cacheWrite: 0,
       },
@@ -697,6 +738,8 @@ export function recordTurnUsage(
       promptChars: turn.promptChars,
       promptTokens: estimate.tokens,
       charsPerToken: estimate.charsPerToken,
+      outputPerStreamedToken: estimate.outputPerStreamedToken,
+      streamedTokens: turn.streamedTokens,
     };
   }
   if (reported) {
@@ -920,6 +963,7 @@ export function runCursorTurn(opts: {
       );
       let reported: any;
       let thinkingBlocks = 0;
+      let streamedTokens = 0;
       const recordUsage = () =>
         recordTurnUsage(output, {
           model,
@@ -929,6 +973,7 @@ export function runCursorTurn(opts: {
           estimate,
           reported,
           thinkingBlocks,
+          streamedTokens,
           calculateCost: deps.calculateCost,
         });
 
@@ -958,7 +1003,9 @@ export function runCursorTurn(opts: {
       run = await agent.send(userMessage, {
         onDelta: ({ update }: any) => {
           if (update?.type === "thinking-completed") thinkingBlocks++;
-          else if (update?.type === "turn-ended" && update.usage) {
+          else if (update?.type === "token-delta") {
+            streamedTokens += Number(update.tokens) || 0;
+          } else if (update?.type === "turn-ended" && update.usage) {
             reported = update.usage;
           }
         },

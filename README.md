@@ -112,7 +112,7 @@ The extension registers a complete pi `Provider` via `createProvider()`. It also
 - Each pi model round-trip creates a fresh Cursor agent with `tools: []` (or MCP-only for pi tools). Cursor does not keep its own tool loop or session memory.
 - Costs are not available from the SDK catalog, so costs show as $0 in usage.
 - A model without a context option in the catalog gets a 200K context window.
-- Cursor reports token usage only when a run ends, as the sum of all model calls in that run. The bridge divides the sum by the number of calls. A turn that hands a tool call to pi reports no usage, so it gets an estimate. The `cursor_usage` diagnostic on each message shows which value pi got.
+- Cursor reports token usage only when a run ends, as the sum of all model calls in that run. The bridge divides the prompt tokens by the number of calls and keeps the full output. A turn that hands a tool call to pi reports no usage, so it gets an estimate from the streamed token counts. The `cursor_usage` diagnostic on each message shows which value pi got.
 
 ## Development
 
